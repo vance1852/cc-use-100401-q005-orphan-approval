@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+import sqlite3
 import uuid
 from typing import Sequence
 
 from .analytics import confidence_interval, summarize_response_profile, yield_rate
 from .auth import Auth
+from .errors import Conflict, InvalidState
 from .storage import connect, event, transaction, utcnow
+
+
+# 每种决定落地后的批次状态。
+DECISION_STATUS = {"release": "released", "hold": "hold", "reject": "rejected"}
+# 只有工程状态下的批次可以受理审批；放行/拒收/挂起均为终结状态。
+APPROVABLE_STATUS = "engineering"
+# 审批期间允许流转到的状态。
+TERMINAL_STATUS = set(DECISION_STATUS.values())
 
 
 class MetricQualityService:
@@ -27,7 +37,11 @@ class MetricQualityService:
             raise ValueError("lot fields are invalid")
         now = utcnow()
         with transaction(self.db):
-            self.db.execute("INSERT INTO metric_batches VALUES(?,?,?,?,?,?,?,?)", (lot_id, product, process_rev, sample_count, "engineering", actor.user_id, now, now))
+            self.db.execute(
+                "INSERT INTO metric_batches(lot_id,product,process_rev,sample_count,status,owner,revision,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,1,?,?)",
+                (lot_id, product, process_rev, sample_count, APPROVABLE_STATUS, actor.user_id, now, now),
+            )
             event(self.db, lot_id, "created", actor.user_id, {"product": product, "process_rev": process_rev})
         return self.get_lot(token, lot_id)
 
@@ -58,16 +72,86 @@ class MetricQualityService:
         ci = confidence_interval([r[1] for r in rows])
         return {"lot_id": lot_id, "response_profile": summary.__dict__, "yield": rates, "response_ci": ci}
 
-    def approve(self, token: str, lot_id: str, decision: str, reason: str) -> dict:
+    def approve(
+        self,
+        token: str,
+        lot_id: str,
+        decision: str,
+        reason: str,
+        expected_revision: int,
+    ) -> dict:
+        # 调用方资格与入参在事务外即可判定；目标批次、状态与版本必须在
+        # 同一事务内随状态更新一起验证，失败时整笔回滚，不留审批或审计。
         actor = self.auth.require(token, "approve")
-        if decision not in {"release", "hold", "reject"} or not reason.strip():
+        if decision not in DECISION_STATUS or not reason.strip():
             raise ValueError("decision and reason are required")
+        if not isinstance(expected_revision, int) or expected_revision < 1:
+            raise ValueError("expected_revision must be a positive integer")
+        status = DECISION_STATUS[decision]
+        now = utcnow()
         with transaction(self.db):
-            self.db.execute("INSERT OR REPLACE INTO approvals VALUES(?,?,?,?,?)", (lot_id, actor.user_id, decision, reason, utcnow()))
-            status = {"release": "released", "hold": "hold", "reject": "rejected"}[decision]
-            self.db.execute("UPDATE metric_batches SET status=?,updated_at=? WHERE lot_id=?", (status, utcnow(), lot_id))
-            event(self.db, lot_id, "approval", actor.user_id, {"decision": decision, "reason": reason})
-        return self.get_lot(token, lot_id)
+            row = self.db.execute(
+                "SELECT revision,status FROM metric_batches WHERE lot_id=?", (lot_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(lot_id)
+            if row["status"] in TERMINAL_STATUS:
+                # 已终结批次：完全一致的重放返回原结果；改变决定或
+                # 理由的重放必须指出与哪一版冲突，且不写入任何新事实。
+                previous = self.db.execute(
+                    "SELECT revision,decision,reason,reviewer FROM approvals "
+                    "WHERE lot_id=? ORDER BY revision DESC,rowid DESC LIMIT 1",
+                    (lot_id,),
+                ).fetchone()
+                if previous is None:
+                    raise RuntimeError(f"lot {lot_id} is terminal without recorded approval")
+                if (
+                    previous["revision"] == expected_revision
+                    and previous["decision"] == decision
+                    and previous["reason"] == reason
+                ):
+                    return {
+                        "lot_id": lot_id,
+                        "status": row["status"],
+                        "revision": row["revision"],
+                        "replayed": True,
+                    }
+                raise Conflict(
+                    f"approval conflicts with revision {previous['revision']} "
+                    f"decision {previous['decision']!r}"
+                )
+            if row["status"] != APPROVABLE_STATUS:
+                raise InvalidState(f"lot status {row['status']!r} is not approvable")
+            if row["revision"] != expected_revision:
+                raise Conflict(
+                    f"stale revision: expected {row['revision']}, caller provided {expected_revision}"
+                )
+            cursor = self.db.execute(
+                "UPDATE metric_batches SET status=?,revision=revision+1,updated_at=? "
+                "WHERE lot_id=? AND status=? AND revision=?",
+                (status, now, lot_id, APPROVABLE_STATUS, expected_revision),
+            )
+            # 只有目标状态实际更新成功，才允许写入决定和审计事件。
+            if cursor.rowcount != 1:
+                raise Conflict("lot state or revision changed concurrently")
+            try:
+                self.db.execute(
+                    "INSERT INTO approvals(lot_id,revision,reviewer,decision,reason,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (lot_id, expected_revision, actor.user_id, decision, reason, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise Conflict("approval for this revision already exists") from exc
+            event(
+                self.db,
+                lot_id,
+                "approval",
+                actor.user_id,
+                {"decision": decision, "reason": reason, "revision": expected_revision},
+            )
+        result = self.get_lot(token, lot_id)
+        result["replayed"] = False
+        return result
 
     def audit(self, token: str, lot_id: str) -> list[dict]:
         self.auth.require(token, "read")

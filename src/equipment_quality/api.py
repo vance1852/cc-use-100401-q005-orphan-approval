@@ -6,7 +6,18 @@ import argparse
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from .errors import Conflict, InvalidState
 from .service import MetricQualityService
+
+
+def _error_status(exc: Exception) -> int:
+    if isinstance(exc, KeyError):
+        return 404
+    if isinstance(exc, PermissionError):
+        return 403
+    if isinstance(exc, (Conflict, InvalidState)):
+        return 409
+    return 400
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -28,7 +39,7 @@ class Handler(BaseHTTPRequestHandler):
                 token = self.headers.get("Authorization", "").removeprefix("Bearer ")
                 return self._json(200, self.service.get_lot(token, self.path.split("/", 2)[2]))
             except Exception as exc:
-                return self._json(400, {"error": str(exc)})
+                return self._json(_error_status(exc), {"error": str(exc)})
         return self._json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -44,11 +55,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(201, self.service.add_measurement(token, lot_id, body["test_frequency_hz"], body["response"], body.get("noise", 0.0), body["instrument"]))
             if self.path.startswith("/lots/") and self.path.endswith("/analysis"):
                 return self._json(200, self.service.analyze(token, self.path.split("/")[2]))
+            if self.path.startswith("/lots/") and self.path.endswith("/approvals"):
+                lot_id = self.path.split("/")[2]
+                return self._json(200, self.service.approve(token, lot_id, body["decision"], body["reason"], body["expected_revision"]))
             return self._json(404, {"error": "not found"})
-        except PermissionError as exc:
-            return self._json(403, {"error": str(exc)})
         except Exception as exc:
-            return self._json(400, {"error": str(exc)})
+            return self._json(_error_status(exc), {"error": str(exc)})
 
 
 def main() -> None:
