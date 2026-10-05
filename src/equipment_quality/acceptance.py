@@ -16,7 +16,7 @@ def run() -> dict:
     for report_period, response in ((450, .71), (520, .93), (650, .84)):
         service.add_measurement(token, "BATCH-DEMO", report_period, response, .01, "reporting-gateway-1")
     result = service.analyze(token, "BATCH-DEMO")
-    service.approve(token, "BATCH-DEMO", "hold", "awaiting data quality review")
+    service.approve(token, "BATCH-DEMO", "hold", "awaiting data quality review", 1)
     return {"status": "ok", "batch": result["lot_id"], "peak_period": result["response_profile"]["peak_test_frequency_hz"], "events": len(service.audit(token, "BATCH-DEMO"))}
 
 

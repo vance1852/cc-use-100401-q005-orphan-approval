@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import uuid
-from typing import Sequence
 
 from .analytics import confidence_interval, summarize_response_profile, yield_rate
 from .auth import Auth
-from .storage import connect, event, transaction, utcnow
+from .errors import ReplayConflict, ReviewClosed, StaleRevision
+from .storage import DECISION_STATUS, TERMINAL_STATUSES, connect, event, transaction, utcnow
 
 
 class MetricQualityService:
@@ -27,7 +27,10 @@ class MetricQualityService:
             raise ValueError("lot fields are invalid")
         now = utcnow()
         with transaction(self.db):
-            self.db.execute("INSERT INTO metric_batches VALUES(?,?,?,?,?,?,?,?)", (lot_id, product, process_rev, sample_count, "engineering", actor.user_id, now, now))
+            self.db.execute(
+                "INSERT INTO metric_batches VALUES(?,?,?,?,?,?,?,?,1)",
+                (lot_id, product, process_rev, sample_count, "engineering", actor.user_id, now, now),
+            )
             event(self.db, lot_id, "created", actor.user_id, {"product": product, "process_rev": process_rev})
         return self.get_lot(token, lot_id)
 
@@ -58,16 +61,83 @@ class MetricQualityService:
         ci = confidence_interval([r[1] for r in rows])
         return {"lot_id": lot_id, "response_profile": summary.__dict__, "yield": rates, "response_ci": ci}
 
-    def approve(self, token: str, lot_id: str, decision: str, reason: str) -> dict:
-        actor = self.auth.require(token, "approve")
-        if decision not in {"release", "hold", "reject"} or not reason.strip():
+    def approve(self, token: str, lot_id: str, decision: str, reason: str, expected_revision: int) -> dict:
+        """在同一事务内完成门禁决定。
+
+        事务开启后依次验证操作者资格、目标批次存在性、允许的批次状态以及
+        调用方提供的修订号；批次行的状态条件更新实际命中后，才允许写入
+        审批决定和审计事件。任一环节失败（不存在、已终结、无权限、版本
+        落后）都随事务整体回滚，不留下任何业务事实。
+
+        同一审批人对同一批次重放：决定与理由完全一致时返回原结果；
+        内容改变则抛出 ReplayConflict，并指明与哪一版已生效决定冲突。
+        """
+        if decision not in DECISION_STATUS or not reason.strip():
             raise ValueError("decision and reason are required")
+        if not isinstance(expected_revision, int) or isinstance(expected_revision, bool) or expected_revision < 1:
+            raise ValueError("expected_revision is required")
         with transaction(self.db):
-            self.db.execute("INSERT OR REPLACE INTO approvals VALUES(?,?,?,?,?)", (lot_id, actor.user_id, decision, reason, utcnow()))
-            status = {"release": "released", "hold": "hold", "reject": "rejected"}[decision]
-            self.db.execute("UPDATE metric_batches SET status=?,updated_at=? WHERE lot_id=?", (status, utcnow(), lot_id))
-            event(self.db, lot_id, "approval", actor.user_id, {"decision": decision, "reason": reason})
-        return self.get_lot(token, lot_id)
+            actor = self.auth.require(token, "approve")
+            lot = self.db.execute(
+                "SELECT status,revision FROM metric_batches WHERE lot_id=?", (lot_id,)
+            ).fetchone()
+            if lot is None:
+                raise KeyError(lot_id)
+
+            recorded = self.db.execute(
+                "SELECT decision,reason,revision,created_at FROM approvals WHERE lot_id=? AND reviewer=?",
+                (lot_id, actor.user_id),
+            ).fetchone()
+            if recorded is not None:
+                if recorded["decision"] == decision and recorded["reason"] == reason:
+                    return {
+                        "lot_id": lot_id,
+                        "decision": recorded["decision"],
+                        "reason": recorded["reason"],
+                        "revision": recorded["revision"],
+                        "decided_at": recorded["created_at"],
+                        "replayed": True,
+                    }
+                raise ReplayConflict(
+                    f"replay conflicts with revision {recorded['revision']} "
+                    f"decision '{recorded['decision']}': {recorded['reason']}"
+                )
+
+            if lot["status"] in TERMINAL_STATUSES:
+                raise ReviewClosed(f"lot {lot_id} is {lot['status']} and cannot be decided again")
+            if expected_revision != lot["revision"]:
+                raise StaleRevision(
+                    f"expected revision {expected_revision} but lot {lot_id} is at {lot['revision']}"
+                )
+
+            new_revision = lot["revision"] + 1
+            new_status = DECISION_STATUS[decision]
+            now = utcnow()
+            cursor = self.db.execute(
+                "UPDATE metric_batches SET status=?,updated_at=?,revision=? "
+                "WHERE lot_id=? AND revision=?",
+                (new_status, now, new_revision, lot_id, lot["revision"]),
+            )
+            if cursor.rowcount != 1:
+                raise StaleRevision(f"lot {lot_id} revision changed before the decision was written")
+
+            self.db.execute(
+                "INSERT INTO approvals(lot_id,reviewer,decision,reason,created_at,revision) "
+                "VALUES(?,?,?,?,?,?)",
+                (lot_id, actor.user_id, decision, reason, now, new_revision),
+            )
+            event(
+                self.db,
+                lot_id,
+                "approval",
+                actor.user_id,
+                {"decision": decision, "reason": reason, "revision": new_revision},
+            )
+        lot_state = self.get_lot(token, lot_id)
+        lot_state.update(
+            {"decision": decision, "decision_revision": new_revision, "replayed": False}
+        )
+        return lot_state
 
     def audit(self, token: str, lot_id: str) -> list[dict]:
         self.auth.require(token, "read")
